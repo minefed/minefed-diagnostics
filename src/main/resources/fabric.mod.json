@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "minefed-diagnostics",
+  "version": "${version}",
+  "name": "Minefed Diagnostics",
+  "description": "Server-side hang, chunk loading and chunk sending diagnostics for Minefed.",
+  "authors": ["Minefed"],
+  "license": "MIT",
+  "environment": "server",
+  "accessWidener": "minefed-diagnostics.accesswidener",
+  "mixins": ["minefed-diagnostics.mixins.json"],
+  "entrypoints": {
+    "server": ["team.minefed.diagnostics.MinefedDiagnostics"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "fabric-api": "*",
+    "minecraft": "=1.20.4",
+    "java": ">=17"
+  }
+}
