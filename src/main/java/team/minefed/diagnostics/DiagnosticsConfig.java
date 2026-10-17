@@ -54,7 +54,8 @@ public final class DiagnosticsConfig {
         pollIntervalMs = clamp(parseLong(values, "watchdog.pollIntervalMs"), 10, 1000);
         stallThresholdMs = clamp(parseLong(values, "stall.thresholdMs"), 200, 600_000);
         stallReportMinMs = clamp(parseLong(values, "stall.reportMinMs"), stallThresholdMs, 600_000);
-        stallSampleIntervalMs = clamp(parseLong(values, "stall.sampleIntervalMs"), 10, 5_000);
+        // Old configurations used 50ms. Enforce the safety floor for existing files too.
+        stallSampleIntervalMs = clamp(parseLong(values, "stall.sampleIntervalMs"), 250, 5_000);
         stallFirstDumpMs = clamp(parseLong(values, "stall.firstDumpMs"), stallThresholdMs, 600_000);
         stallSecondDumpMs = clamp(parseLong(values, "stall.secondDumpMs"), stallFirstDumpMs, 600_000);
         stallMaxSamples = (int) clamp(parseLong(values, "stall.maxSamples"), 10, 100_000);
@@ -85,7 +86,7 @@ public final class DiagnosticsConfig {
         d.put("watchdog.pollIntervalMs", "50");
         d.put("stall.thresholdMs", "1000");
         d.put("stall.reportMinMs", "3000");
-        d.put("stall.sampleIntervalMs", "50");
+        d.put("stall.sampleIntervalMs", "250");
         d.put("stall.firstDumpMs", "5000");
         d.put("stall.secondDumpMs", "40000");
         d.put("stall.maxSamples", "2400");

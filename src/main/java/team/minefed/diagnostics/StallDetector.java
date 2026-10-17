@@ -19,6 +19,8 @@ public final class StallDetector {
     private boolean stalled;
     private long stallTickEnd;
     private long lastSample;
+    private boolean sampled;
+    private long sampleDelayNanos;
     private int sampleCount;
     private boolean firstDumpDone;
     private boolean secondDumpDone;
@@ -32,6 +34,7 @@ public final class StallDetector {
     StallDetector(long thresholdMs, long sampleIntervalMs, long firstDumpMs, long secondDumpMs, int maxSamples) {
         this.thresholdNanos = thresholdMs * 1_000_000L;
         this.sampleIntervalNanos = sampleIntervalMs * 1_000_000L;
+        this.sampleDelayNanos = sampleIntervalNanos;
         this.firstDumpNanos = firstDumpMs * 1_000_000L;
         this.secondDumpNanos = secondDumpMs * 1_000_000L;
         this.maxSamples = maxSamples;
@@ -52,7 +55,7 @@ public final class StallDetector {
                 return actions;
             }
             long elapsed = now - stallTickEnd;
-            if (sampleCount < maxSamples && now - lastSample >= sampleIntervalNanos) sample(now, actions);
+            if (sampleCount < maxSamples && now - lastSample >= sampleDelayNanos) sample(now, actions);
             if (!firstDumpDone && elapsed >= firstDumpNanos) {
                 firstDumpDone = true;
                 actions.add(Action.FIRST_DUMP);
@@ -70,15 +73,23 @@ public final class StallDetector {
             firstDumpDone = false;
             secondDumpDone = false;
             actions.add(Action.STARTED);
-            sample(now, actions);
+            if (!sampled || now - lastSample >= sampleDelayNanos) sample(now, actions);
         }
         return actions;
     }
 
     private void sample(long now, EnumSet<Action> actions) {
         lastSample = now;
+        sampled = true;
         sampleCount++;
         actions.add(Action.SAMPLE);
+    }
+
+    /** Leave the JVM time to recover if obtaining a sample itself was slow. */
+    void sampleCompleted(long now, long durationNanos) {
+        lastSample = now;
+        long backoff = Math.min(Math.max(0, durationNanos), 7_500_000_000L) * 4;
+        sampleDelayNanos = Math.max(sampleIntervalNanos, backoff);
     }
 
     /** @param endTime the end of the first tick that finished after the stall, or now when ticking stopped */

@@ -54,6 +54,7 @@ public final class DiagnosticsService {
     private final StallDetector stallDetector;
     private final SlowTickDetector slowTicks;
     private final AutomaticCapture automaticCapture;
+    private final ThreadDumpLimiter threadDumpLimiter = new ThreadDumpLimiter(30_000_000_000L, System::nanoTime);
     private final ExecutorService reporter;
     private final Map<String, Long> lastLog = new ConcurrentHashMap<>();
     private final Map<String, Long> lastReport = new ConcurrentHashMap<>();
@@ -98,8 +99,7 @@ public final class DiagnosticsService {
         this.slowTicks = new SlowTickDetector(config.slowTickWindow, config.slowTickThresholdMs);
         this.automaticCapture = new AutomaticCapture(config, reportDirectory.resolve("captures"), () -> {
             StringBuilder text = new StringBuilder();
-            ThreadDumps.appendDeadlocks(text, attribution);
-            ThreadDumps.appendAllThreads(text, attribution, serverThread.getId(), threadNotes());
+            appendThreadDump(text);
             return text.toString();
         }, message -> MinefedDiagnostics.LOGGER.info("{}", message));
         this.reporter = Executors.newSingleThreadExecutor(r -> {
@@ -295,8 +295,7 @@ public final class DiagnosticsService {
             appendBlockingCalls(out, false);
             if (withThreads) {
                 out.append("\n=== Thread dump ===\n");
-                ThreadDumps.appendDeadlocks(out, attribution);
-                ThreadDumps.appendAllThreads(out, attribution, serverThread.getId(), threadNotes());
+                appendThreadDump(out);
             }
             Path file = writer.write("chunk-send-stall", out.toString());
             if (file != null) MinefedDiagnostics.LOGGER.warn("Chunk send stall report: {}", file);
@@ -364,13 +363,21 @@ public final class DiagnosticsService {
         }
         StallRecord record = stall;
         if (record == null) return;
-        if (actions.contains(StallDetector.Action.SAMPLE)) record.sample();
-        if (actions.contains(StallDetector.Action.FIRST_DUMP) || actions.contains(StallDetector.Action.SECOND_DUMP)) {
+        if (actions.contains(StallDetector.Action.SAMPLE)) {
+            long sampleStarted = System.nanoTime();
+            try {
+                record.sample();
+            } finally {
+                long sampleEnded = System.nanoTime();
+                stallDetector.sampleCompleted(sampleEnded, sampleEnded - sampleStarted);
+            }
+        }
+        if (!stopping && lastTickEnd == record.tickEnd
+                && (actions.contains(StallDetector.Action.FIRST_DUMP) || actions.contains(StallDetector.Action.SECOND_DUMP))) {
             long elapsedMs = (now - record.tickEnd) / 1_000_000;
             StringBuilder dump = new StringBuilder();
             dump.append("=== Thread dump at ").append(elapsedMs).append("ms into the stall ===\n");
-            ThreadDumps.appendDeadlocks(dump, attribution);
-            ThreadDumps.appendAllThreads(dump, attribution, serverThread.getId(), threadNotes());
+            appendThreadDump(dump);
             record.dumps.add(dump.toString());
             record.pipelineAtDump = pipelineText(60);
             String text = renderStall(record, now, false);
@@ -429,8 +436,7 @@ public final class DiagnosticsService {
         appendPipeline(out, 0);
         appendBlockingCalls(out, false);
         out.append("\n=== Thread dump ===\n");
-        ThreadDumps.appendDeadlocks(out, attribution);
-        ThreadDumps.appendAllThreads(out, attribution, serverThread.getId(), threadNotes());
+        appendThreadDump(out);
         Path file = writer.write("chunk-pipeline-stall", out.toString());
         if (file != null) MinefedDiagnostics.LOGGER.warn("Chunk pipeline stall report: {}", file);
     }
@@ -719,8 +725,7 @@ public final class DiagnosticsService {
             out.append('\n');
             ThreadDumps.appendJvm(out);
             out.append("\n=== Thread dump ===\n");
-            ThreadDumps.appendDeadlocks(out, attribution);
-            ThreadDumps.appendAllThreads(out, attribution, serverThread.getId(), threadNotes());
+            appendThreadDump(out);
             done.accept(writer.write("snapshot", out.toString()));
         });
     }
@@ -738,6 +743,15 @@ public final class DiagnosticsService {
         sendStalls.reset();
         ackResets.reset();
         lastStallCulprit = "-";
+    }
+
+    private void appendThreadDump(StringBuilder out) {
+        if (!threadDumpLimiter.run(() -> {
+            ThreadDumps.appendDeadlocks(out, attribution);
+            ThreadDumps.appendAllThreads(out, attribution, serverThread.getId(), threadNotes());
+        })) {
+            out.append("Thread snapshot skipped: another snapshot is running or completed less than 30s ago.\n");
+        }
     }
 
     private void logSummary(String reason) {

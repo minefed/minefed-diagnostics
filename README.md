@@ -15,7 +15,7 @@ Minecraft 1.20.4 / Fabric Loader 0.18.4 / Java 17 이상의 서버 전용 진단
 | 대기 청크가 있는데 배치 준비·ACK 등 전송 진전이 10초간 없음 | 전송 상태 보고서와 수집 요청 |
 
 `logs/minefed-diagnostics/captures/capture-<UTC>-<UUID>.txt`와 같은 이름의 `.jfr`에 저장한다.
-텍스트에는 감지·수집 시각, 직전 OS/JVM 지표, 현재 지표, 전체 스레드 덤프가 들어간다.
+텍스트에는 감지·수집 시각, 직전 OS/JVM 지표, 현재 지표, 수집 제한에 따라 전체 스레드 스냅샷 또는 생략 사유가 들어간다.
 JFR은 기본 최근 120초 / 최대 32MiB의 순환 기록이다. 이상 감지 후 별도 작업 스레드가 현재 기록을 덤프하고 계속 기록한다.
 최초 기동 직후에는 이력이 짧으며, 저장 지연 동안 오래된 기록이 순환 범위 밖으로 밀릴 수 있다.
 JFR을 사용할 수 없어도 OS/스레드 텍스트 수집을 시도한다. 개별 관측 실패는 `UNAVAILABLE`로 남긴다.
@@ -60,7 +60,7 @@ MinecraftServer.tick 진입·반환을 계측하므로 Fabric START/END 콜백�
 | `capture.retain` / `capture.retainMiB` | 8 / 512 | 자동 수집 보관 건수 / 합산 용량 |
 | `slowTicks.window` / `slowTicks.thresholdMs` | 100 / 75 | 완료 틱 창 / 평균 작업 시간 기준 |
 | `stall.thresholdMs` / `stall.reportMinMs` | 1000 / 3000 | 정지 감지 / 상세 보고서 최소 길이 |
-| `stall.sampleIntervalMs` | 50 | 정지 중 스택 표본 간격 |
+| `stall.sampleIntervalMs` | 250 | 정지 중 스택 표본 간격. 기존 설정도 최소 250ms 적용 |
 | `stall.firstDumpMs` / `stall.secondDumpMs` | 5000 / 40000 | 진행 중 상세 덤프 시점 |
 | `syncLoad.warnMs` / `offThread.warnMs` | 100 / 500 | 서버 / 다른 스레드의 동기 청크 대기 기록 기준 |
 | `chunkTask.stallMs` / `chunkSend.stallMs` | 20000 / 10000 | 청크 작업 / 전송 관측 기준 |
@@ -76,6 +76,15 @@ MinecraftServer.tick 진입·반환을 계측하므로 Fabric START/END 콜백�
 `/mfdiag selftest stall <ms>`는 서버를 실제로 정지시키므로 격리된 테스트 서버에서만 사용한다.
 
 ## 부하와 빌드
+
+1.1.2부터 스택 수집은 소유 중인 모니터·동기화 락 목록을 요청하지 않는다.
+이전의 `lockedSynchronizers=true`는 단일 스레드 조회에도 safepoint에서 힙 전체를 조사해
+대형 힙에서 수 초의 정지를 반복할 수 있었다. 현재 대기 중인 락과 소유자 정보는 유지하며,
+스택은 스레드마다 최대 256프레임으로 제한한다. 자체 JFR의 `jdk.ThreadDump` 이벤트도 끈다.
+스택 표본 간격은 수집 완료부터 계산하고, 수집이 느리면 소요 시간의 4배까지 기다린다
+(최소 설정 간격, 최대 30초). 이 대기는 새 정지가 감지되어도 유지한다.
+모든 전체 스냅샷과 교착 검사(수동 `dump` 포함)는 실행 중 중복 수집을 생략하고
+완료 후 30초의 공통 간격을 적용한다. 생략 시 나머지 보고서와 JFR 수집은 계속한다.
 
 틱 훅은 시간·고정 크기 창을 갱신하고 필요할 때 작업을 등록한다. 파일 쓰기·OS 수집·JFR 덤프는 별도 데몬 스레드에서 수행한다.
 메인 스레드의 `getChunk` 캐시 조회에는 인자 관측만 추가하며, 계측을 위한 배열·박싱·콜백 객체를 만들지 않는다.

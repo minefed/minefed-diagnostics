@@ -70,7 +70,7 @@ class AutomaticCaptureTest {
             var events = RecordingFile.readAllEvents(jfr);
             assertTrue(events.stream().anyMatch(e -> e.getEventType().getName().equals("minefed.TickWindow")
                     && e.getDouble("averageMs") == 90));
-            assertFalse(events.stream().anyMatch(e -> List.of("jdk.InitialEnvironmentVariable", "jdk.InitialSystemProperty", "jdk.JVMInformation")
+            assertFalse(events.stream().anyMatch(e -> List.of("jdk.InitialEnvironmentVariable", "jdk.InitialSystemProperty", "jdk.JVMInformation", "jdk.ThreadDump")
                     .contains(e.getEventType().getName())));
         } finally { capture.close(); }
     }

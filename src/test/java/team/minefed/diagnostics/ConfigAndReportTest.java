@@ -22,10 +22,18 @@ class ConfigAndReportTest {
         p.setProperty("chunkSend.resetStuckAcks", "TRUE");
         DiagnosticsConfig config = DiagnosticsConfig.fromProperties(p);
         assertEquals(1000, config.stallThresholdMs);
-        assertEquals(10, config.stallSampleIntervalMs);
+        assertEquals(250, config.stallSampleIntervalMs);
         assertEquals(1000, config.stallFirstDumpMs, "a dump cannot come before the stall threshold");
         assertTrue(config.chunkSendResetStuckAcks);
         assertFalse(DiagnosticsConfig.defaultsOnly().chunkSendResetStuckAcks, "recovery is opt-in");
+    }
+
+    @Test
+    void legacyFastSamplingCannotBypassSafetyFloor() {
+        Properties p = new Properties();
+        p.setProperty("stall.sampleIntervalMs", "50");
+        assertEquals(250, DiagnosticsConfig.fromProperties(p).stallSampleIntervalMs);
+        assertEquals(250, DiagnosticsConfig.defaultsOnly().stallSampleIntervalMs);
     }
 
     @Test

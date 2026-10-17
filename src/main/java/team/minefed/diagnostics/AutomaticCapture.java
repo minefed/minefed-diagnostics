@@ -80,6 +80,8 @@ final class AutomaticCapture implements AutoCloseable {
                     recording.disable("jdk.InitialEnvironmentVariable");
                     recording.disable("jdk.InitialSystemProperty");
                     recording.disable("jdk.JVMInformation");
+                    // Text snapshots use the shared bounded/rate-limited path; avoid a second JFR dump path.
+                    recording.disable("jdk.ThreadDump");
                     recording.enable("jdk.ExecutionSample").withPeriod(Duration.ofMillis(20));
                     recording.enable("jdk.FileRead").withThreshold(Duration.ofMillis(10));
                     recording.enable("jdk.FileWrite").withThreshold(Duration.ofMillis(10));

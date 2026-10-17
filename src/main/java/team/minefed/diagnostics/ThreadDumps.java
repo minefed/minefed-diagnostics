@@ -14,8 +14,9 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 
-/** Thread dump and JVM state formatting. {@link ThreadInfo#toString()} cuts stacks at 8 frames, so this does it in full. */
+/** Bounded thread snapshots and JVM state formatting, without owned-lock heap scans. */
 public final class ThreadDumps {
+    static final int MAX_STACK_DEPTH = 256;
     private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
 
     private ThreadDumps() {}
@@ -24,10 +25,15 @@ public final class ThreadDumps {
         return THREADS;
     }
 
-    /** Samples one thread with full depth and lock information, or returns {@code null} if it is gone. */
+    /** Samples a bounded stack and its current wait/owner, or returns {@code null} if the thread is gone. */
     public static ThreadInfo sample(long threadId) {
-        ThreadInfo[] infos = THREADS.getThreadInfo(new long[]{threadId}, true, true);
-        return infos.length == 0 ? null : infos[0];
+        return sample(THREADS, threadId);
+    }
+
+    static ThreadInfo sample(ThreadMXBean threads, long threadId) {
+        // lockedSynchronizers=true walks the entire heap at a safepoint even for one thread.
+        // The depth-only overload preserves the current wait and owner without collecting owned locks.
+        return threads.getThreadInfo(threadId, MAX_STACK_DEPTH);
     }
 
     /** What a blocked or waiting thread waits on, in one line; {@code null} for a running thread. */
@@ -38,24 +44,34 @@ public final class ThreadDumps {
         return text;
     }
 
-    /** Full dump, the server thread first, then threads with mod or chunk work, then the rest by name. */
+    /** Bounded stacks for all threads, the server thread first and the rest by name. */
     public static void appendAllThreads(StringBuilder out, ModAttribution attribution, long serverThreadId,
                                         Map<Long, String> notes) {
-        ThreadInfo[] infos = THREADS.dumpAllThreads(THREADS.isObjectMonitorUsageSupported(),
-                THREADS.isSynchronizerUsageSupported());
+        appendAllThreads(THREADS, out, attribution, serverThreadId, notes);
+    }
+
+    static void appendAllThreads(ThreadMXBean threads, StringBuilder out, ModAttribution attribution,
+                                 long serverThreadId, Map<Long, String> notes) {
+        ThreadInfo[] infos = threads.dumpAllThreads(false, false, MAX_STACK_DEPTH);
         Arrays.sort(infos, Comparator.comparing((ThreadInfo t) -> t.getThreadId() != serverThreadId)
                 .thenComparing(ThreadInfo::getThreadName));
         out.append("Threads: ").append(infos.length).append('\n');
+        appendSnapshotLimits(out);
         for (ThreadInfo info : infos) {
-            appendThread(out, info, attribution, notes.get(info.getThreadId()));
+            appendThread(threads, out, info, attribution, notes.get(info.getThreadId()));
         }
     }
 
     public static void appendThread(StringBuilder out, ThreadInfo info, ModAttribution attribution, String note) {
+        appendThread(THREADS, out, info, attribution, note);
+    }
+
+    private static void appendThread(ThreadMXBean threads, StringBuilder out, ThreadInfo info,
+                                     ModAttribution attribution, String note) {
         out.append('"').append(info.getThreadName()).append("\" id=").append(info.getThreadId())
                 .append(info.isDaemon() ? " daemon" : "").append(" prio=").append(info.getPriority())
                 .append(' ').append(info.getThreadState());
-        long cpu = cpuMillis(info.getThreadId());
+        long cpu = cpuMillis(threads, info.getThreadId());
         if (cpu >= 0) out.append(" cpu=").append(cpu).append("ms");
         if (info.getLockName() != null) out.append(" on ").append(info.getLockName());
         if (info.getLockOwnerName() != null) {
@@ -81,6 +97,9 @@ public final class ThreadDumps {
                 if (monitor.getLockedStackDepth() == i) out.append("    - locked ").append(monitor).append('\n');
             }
         }
+        if (stack.length >= MAX_STACK_DEPTH) {
+            out.append("    ... stack limit reached (").append(MAX_STACK_DEPTH).append(" frames)\n");
+        }
         LockInfo[] synchronizers = info.getLockedSynchronizers();
         if (synchronizers.length > 0) {
             out.append("    Locked synchronizers:\n");
@@ -89,10 +108,15 @@ public final class ThreadDumps {
         out.append('\n');
     }
 
-    private static long cpuMillis(long threadId) {
+    private static void appendSnapshotLimits(StringBuilder out) {
+        out.append("Stacks limited to ").append(MAX_STACK_DEPTH)
+                .append(" frames per thread; owned monitor/synchronizer lists omitted to avoid heap scans.\n");
+    }
+
+    private static long cpuMillis(ThreadMXBean threads, long threadId) {
         try {
-            if (!THREADS.isThreadCpuTimeSupported() || !THREADS.isThreadCpuTimeEnabled()) return -1;
-            long nanos = THREADS.getThreadCpuTime(threadId);
+            if (!threads.isThreadCpuTimeSupported() || !threads.isThreadCpuTimeEnabled()) return -1;
+            long nanos = threads.getThreadCpuTime(threadId);
             return nanos < 0 ? -1 : nanos / 1_000_000;
         } catch (UnsupportedOperationException e) {
             return -1;
@@ -101,14 +125,19 @@ public final class ThreadDumps {
 
     /** Monitor and ownable-synchronizer deadlocks found by the JVM, with the stacks of the threads involved. */
     public static void appendDeadlocks(StringBuilder out, ModAttribution attribution) {
-        long[] ids = THREADS.isSynchronizerUsageSupported() ? THREADS.findDeadlockedThreads() : THREADS.findMonitorDeadlockedThreads();
+        appendDeadlocks(THREADS, out, attribution);
+    }
+
+    static void appendDeadlocks(ThreadMXBean threads, StringBuilder out, ModAttribution attribution) {
+        long[] ids = threads.isSynchronizerUsageSupported() ? threads.findDeadlockedThreads() : threads.findMonitorDeadlockedThreads();
         if (ids == null || ids.length == 0) {
             out.append("JVM deadlock detection: none\n");
             return;
         }
         out.append("JVM deadlock detection: ").append(ids.length).append(" THREADS DEADLOCKED\n");
-        for (ThreadInfo info : THREADS.getThreadInfo(ids, true, true)) {
-            if (info != null) appendThread(out, info, attribution, "deadlocked");
+        appendSnapshotLimits(out);
+        for (ThreadInfo info : threads.getThreadInfo(ids, MAX_STACK_DEPTH)) {
+            if (info != null) appendThread(threads, out, info, attribution, "deadlocked");
         }
     }
 

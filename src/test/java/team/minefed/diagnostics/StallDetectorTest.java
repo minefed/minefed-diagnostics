@@ -71,4 +71,33 @@ class StallDetectorTest {
         assertTrue(detector.isStalled());
         assertEquals(EnumSet.of(Action.ENDED), detector.poll(3000 * MS, 0));
     }
+
+    @Test
+    void slowSamplesBackOffFromCompletionWithoutDelayingRecoveryDetection() {
+        StallDetector detector = new StallDetector(1000, 250, 5000, 40000, 100);
+        long tickEnd = MS;
+        detector.poll(1001 * MS, tickEnd);
+        detector.sampleCompleted(3001 * MS, 2000 * MS);
+        assertFalse(detector.poll(5001 * MS, tickEnd).contains(Action.SAMPLE));
+        assertFalse(detector.poll(11_000 * MS, tickEnd).contains(Action.SAMPLE));
+        assertTrue(detector.poll(11_001 * MS, tickEnd).contains(Action.SAMPLE));
+        detector.sampleCompleted(11_002 * MS, MS);
+        assertFalse(detector.poll(11_251 * MS, tickEnd).contains(Action.SAMPLE));
+        assertTrue(detector.poll(11_252 * MS, tickEnd).contains(Action.SAMPLE));
+        detector.sampleCompleted(20_000 * MS, 8748 * MS);
+        assertEquals(EnumSet.of(Action.ENDED), detector.poll(20_001 * MS, 20_000 * MS));
+        assertEquals(EnumSet.of(Action.STARTED), detector.poll(21_001 * MS, 20_000 * MS),
+                "a new stall must not bypass the recovery time from the preceding slow sample");
+        assertFalse(detector.poll(49_999 * MS, 20_000 * MS).contains(Action.SAMPLE));
+        assertTrue(detector.poll(50_000 * MS, 20_000 * MS).contains(Action.SAMPLE));
+    }
+
+    @Test
+    void sampleBackoffIsBoundedEvenAfterAnExtremeDelay() {
+        StallDetector detector = new StallDetector(1000, 250, 5000, 40000, 100);
+        detector.poll(1001 * MS, MS);
+        detector.sampleCompleted(2001 * MS, Long.MAX_VALUE);
+        assertFalse(detector.poll(32_000 * MS, MS).contains(Action.SAMPLE));
+        assertTrue(detector.poll(32_001 * MS, MS).contains(Action.SAMPLE));
+    }
 }
