@@ -23,8 +23,11 @@ public final class Hooks {
     public static final int HOOK_LOAD = 1 << 3;
     public static final int HOOK_GENERATE = 1 << 4;
     public static final int HOOK_FULL = 1 << 5;
+    public static final int HOOK_TICK_START = 1 << 6;
+    public static final int HOOK_TICK_END = 1 << 7;
+    public static final int HOOK_OFF_THREAD_END = 1 << 8;
     public static final String[] HOOK_NAMES = {"getChunk", "offThreadGetChunk", "syncChunkWait", "loadChunk",
-            "upgradeChunk", "convertToFullChunk"};
+            "upgradeChunk", "convertToFullChunk", "tickStart", "tickEnd", "offThreadGetChunkEnd"};
 
     private static volatile DiagnosticsService service;
     private static volatile int seenHooks;
@@ -76,6 +79,15 @@ public final class Hooks {
         return seenHooks;
     }
 
+    public static void tick(boolean start) {
+        DiagnosticsService s = service;
+        if (s == null) return;
+        try {
+            seen(start ? HOOK_TICK_START : HOOK_TICK_END);
+            if (start) s.onTickStart(); else s.onTickEnd();
+        } catch (RuntimeException | LinkageError e) { s.internalError("tick", e); }
+    }
+
     public static void mainThreadRequest(ServerWorld world, int x, int z, ChunkStatus status, boolean create) {
         lastWorld = world;
         lastX = x;
@@ -120,6 +132,7 @@ public final class Hooks {
     public static void endOffThread(Thread thread) {
         OffThreadWait wait = OFF_THREAD.remove(thread);
         if (wait == null) return;
+        seen(HOOK_OFF_THREAD_END);
         DiagnosticsService s = service;
         if (s != null) s.onOffThreadWait(wait, System.nanoTime() - wait.startNanos());
     }

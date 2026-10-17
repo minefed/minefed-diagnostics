@@ -111,7 +111,7 @@ class ChunkTrackingTest {
         Snapshot waiting = new Snapshot(25, 0, 10, 9f, 9f);
         monitor.observe(player, waiting, 0);
         ChunkSendMonitor.Event event = monitor.observe(player, waiting, 12_000 * MS);
-        assertEquals(Verdict.CHUNKS_NOT_READY, event.verdict());
+        assertEquals(Verdict.NO_CHUNK_SEND_PROGRESS, event.verdict());
         assertFalse(event.resetSuggested(), "never reset when the client is not the problem");
     }
 
@@ -125,5 +125,16 @@ class ChunkTrackingTest {
         assertNull(monitor.observe(player, new Snapshot(5, 0, 10, 9f, 0f), 50_000 * MS),
                 "an empty queue resets the timer even when chunks are added later");
         assertEquals(0, monitor.stuckNanos(UUID.randomUUID(), 0));
+    }
+
+    @Test
+    void constantQueueWithBatchOrAckActivityIsNotAStall() {
+        ChunkSendMonitor monitor = new ChunkSendMonitor(10_000, 30_000);
+        UUID player = UUID.randomUUID();
+        monitor.observe(player, new Snapshot(100, 10, 10, 9f, 0f, 1), 0);
+        assertNull(monitor.observe(player, new Snapshot(100, 10, 10, 9f, 0f, 20), 11_000 * MS));
+        assertNull(monitor.observe(player, new Snapshot(200, 10, 10, 9f, 0f, 40), 22_000 * MS));
+        assertEquals(Verdict.WAITING_FOR_CLIENT_ACK,
+                monitor.observe(player, new Snapshot(200, 10, 10, 9f, 0f, 40), 33_000 * MS).verdict());
     }
 }

@@ -36,7 +36,7 @@ import team.minefed.diagnostics.mixin.VersionedChunkStorageAccessor;
 /**
  * Owns all detectors for one server run. The server thread only updates a heartbeat and checks chunk
  * sending once a second; everything expensive (sampling, dumps, file writes) runs on the watchdog and
- * reporter threads so that the diagnostics never add to the stall they are measuring.
+ * reporter threads. JVM sampling and JFR still have measurement overhead.
  */
 public final class DiagnosticsService {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(ZoneId.systemDefault());
@@ -52,6 +52,8 @@ public final class DiagnosticsService {
     private final BlockingCallTracker offThreadWaits;
     private final ChunkSendMonitor sendMonitor;
     private final StallDetector stallDetector;
+    private final SlowTickDetector slowTicks;
+    private final AutomaticCapture automaticCapture;
     private final ExecutorService reporter;
     private final Map<String, Long> lastLog = new ConcurrentHashMap<>();
     private final Map<String, Long> lastReport = new ConcurrentHashMap<>();
@@ -89,10 +91,17 @@ public final class DiagnosticsService {
         this.serverThread = server.getThread();
         this.writer = new ReportWriter(reportDirectory, config.reportRetain);
         this.chunkTasks = new ChunkTaskTracker(System::nanoTime, config.chunkTaskStallMs / 4);
-        this.syncWaits = new BlockingCallTracker("Server thread blocked waiting for chunks", attribution);
+        this.syncWaits = new BlockingCallTracker("Server thread waits in chunk executor (load or save)", attribution);
         this.offThreadWaits = new BlockingCallTracker("Other threads blocked in getChunk", attribution);
         this.sendMonitor = new ChunkSendMonitor(config.chunkSendStallMs, config.chunkSendResetAfterMs);
         this.stallDetector = new StallDetector(config);
+        this.slowTicks = new SlowTickDetector(config.slowTickWindow, config.slowTickThresholdMs);
+        this.automaticCapture = new AutomaticCapture(config, reportDirectory.resolve("captures"), () -> {
+            StringBuilder text = new StringBuilder();
+            ThreadDumps.appendDeadlocks(text, attribution);
+            ThreadDumps.appendAllThreads(text, attribution, serverThread.getId(), threadNotes());
+            return text.toString();
+        }, message -> MinefedDiagnostics.LOGGER.info("{}", message));
         this.reporter = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Minefed-Diagnostics-Reporter");
             t.setDaemon(true);
@@ -106,6 +115,7 @@ public final class DiagnosticsService {
     public void start() {
         running = true;
         Hooks.install(this);
+        automaticCapture.start();
         reporter.execute(this::indexMods);
         watchdog = new Thread(this::watchdogLoop, "Minefed-Diagnostics-Watchdog");
         watchdog.setDaemon(true);
@@ -125,6 +135,7 @@ public final class DiagnosticsService {
         running = false;
         Hooks.uninstall();
         if (watchdog != null) watchdog.interrupt();
+        automaticCapture.close();
         reporter.shutdown();
     }
 
@@ -151,6 +162,7 @@ public final class DiagnosticsService {
 
     public void onTickStart() {
         tickStart = System.nanoTime();
+        if (lastTickEnd == 0) lastTickEnd = tickStart;
     }
 
     public void onTickEnd() {
@@ -161,6 +173,18 @@ public final class DiagnosticsService {
         if (length > 250_000_000L) longTicks.increment();
         lastTickEnd = now;
         ticks = tick + 1;
+        if (!stopping) {
+            try {
+                SlowTickDetector.Window window = slowTicks.complete(length);
+                if (window != null) {
+                    TickWindowEvent.record(window);
+                    if (window.slow()) automaticCapture.request("slow-ticks: " + window.count()
+                            + " completed ticks, avg=" + window.averageMs() + "ms max=" + window.maximumMs() + "ms", now);
+                }
+            } catch (RuntimeException | LinkageError e) {
+                internalError("automaticTickCapture", e);
+            }
+        }
         if (tick % 20 == 0) {
             try {
                 checkChunkSending(now);
@@ -176,7 +200,7 @@ public final class DiagnosticsService {
             StackTraceElement[] stack = Thread.currentThread().getStackTrace();
             BlockingCallTracker.CallerStats caller = syncWaits.record(stack, nanos, wait.describe());
             if (caller != null && shouldLog("sync:" + caller.caller, 10_000)) {
-                MinefedDiagnostics.LOGGER.warn("Server thread blocked {}ms waiting for chunk {} requested by [{}] {}",
+                MinefedDiagnostics.LOGGER.warn("Server thread waited {}ms in chunk executor; last observed chunk request {}; caller [{}] {}",
                         nanos / 1_000_000, wait.describe(), caller.mod, caller.caller);
             }
         } catch (RuntimeException e) {
@@ -204,7 +228,8 @@ public final class DiagnosticsService {
             LongSet pending = sender.minefedDiagnostics$chunks();
             ChunkSendMonitor.Snapshot snapshot = new ChunkSendMonitor.Snapshot(pending.size(),
                     sender.minefedDiagnostics$unacknowledgedBatches(), sender.minefedDiagnostics$maxUnacknowledgedBatches(),
-                    sender.minefedDiagnostics$desiredBatchSize(), sender.minefedDiagnostics$pending());
+                    sender.minefedDiagnostics$desiredBatchSize(), sender.minefedDiagnostics$pending(),
+                    player.networkHandler.chunkDataSender instanceof ChunkSendProgress progress ? progress.minefedDiagnostics$progress() : -1);
             ChunkSendMonitor.Event event = sendMonitor.observe(player.getUuid(), snapshot, now);
             if (event == null) continue;
             if (event.firstReport()) onSendStall(player, event, pending);
@@ -229,6 +254,7 @@ public final class DiagnosticsService {
     /** Runs on the server thread; collects what must be read there and hands the rest to the reporter. */
     private void onSendStall(ServerPlayerEntity player, ChunkSendMonitor.Event event, LongSet pending) {
         sendStalls.increment();
+        automaticCapture.request("chunk-send observation: " + event.verdict(), System.nanoTime());
         String name = player.getGameProfile().getName();
         ChunkPos center = player.getChunkPos();
         ServerWorld world = player.getServerWorld();
@@ -245,10 +271,10 @@ public final class DiagnosticsService {
         head.append("Player: ").append(name).append(" (").append(player.getUuid()).append(")\n");
         head.append("Verdict: ").append(event.verdict()).append(" for ").append(event.stuckNanos() / 1_000_000).append("ms\n");
         head.append(event.verdict() == ChunkSendMonitor.Verdict.WAITING_FOR_CLIENT_ACK
-                ? "Meaning: the server has chunks ready but waits for the client to acknowledge earlier batches.\n"
-                + "         Look at the network path (proxy, packet loss) and client side, not at chunk loading.\n"
-                : "Meaning: the client acknowledges batches, but the pending chunks never finish loading on the server.\n"
-                + "         See the in-flight chunk tasks and worker threads below.\n");
+                ? "Observation: the sender's unacknowledged batch limit is reached.\n"
+                + "         Correlate client/network activity and server scheduling; this does not prove a network fault.\n"
+                : "Observation: pending chunks remain without observed batch preparation or ACK progress.\n"
+                + "         Check chunk tasks, sender state and worker threads; queue counts alone cannot identify the cause.\n");
         head.append("Sender: ").append(event.snapshot()).append('\n');
         head.append("Latency: ").append(latency).append("ms, world ").append(Hooks.worldName(world)).append(", chunk ")
                 .append(center).append(", view distance ").append(server.getPlayerManager().getViewDistance()).append('\n');
@@ -261,7 +287,7 @@ public final class DiagnosticsService {
             head.append("  ").append(pos).append(" d=").append(distance(center, nearest.get(i))).append(": ")
                     .append(safe(() -> storage.getChunkLoadingDebugInfo(pos))).append('\n');
         }
-        boolean withThreads = event.verdict() == ChunkSendMonitor.Verdict.CHUNKS_NOT_READY;
+        boolean withThreads = event.verdict() == ChunkSendMonitor.Verdict.NO_CHUNK_SEND_PROGRESS;
         reporter.execute(() -> {
             StringBuilder out = new StringBuilder(head);
             out.append('\n');
@@ -314,18 +340,18 @@ public final class DiagnosticsService {
     }
 
     /**
-     * The watchdog sleeps for a few milliseconds; waking up seconds late means every thread was frozen,
-     * e.g. by a stop-the-world pause, swapping, or the container being throttled or suspended.
+     * A delayed watchdog is an observation, not proof that every JVM thread stopped.
      */
     private void onJvmFreeze(long nanos, long now) {
         jvmFreezes.increment();
         maxFreezeNanos.accumulateAndGet(nanos, Math::max);
         lastFreezeEnd = now;
         lastFreezeNanos = nanos;
-        MinefedDiagnostics.LOGGER.warn("Whole JVM was frozen for about {}ms (the watchdog thread could not run). "
-                + "This is not caused by game code: check GC, swap and host/container CPU limits. GC totals: {}",
+        MinefedDiagnostics.LOGGER.warn("Watchdog scheduling delayed by about {}ms. "
+                + "Correlate JFR/GC and OS counters to distinguish GC, CPU contention, swap or suspension. GC totals: {}",
                 nanos / 1_000_000, ThreadDumps.gcTotals().entrySet().stream()
                         .map(e -> e.getKey() + "=" + e.getValue()[0] + "/" + e.getValue()[1] + "ms").toList());
+        if (!stopping) automaticCapture.request("watchdog-delay: " + nanos / 1_000_000 + "ms", now);
     }
 
     private void handleStall(long now) {
@@ -334,6 +360,7 @@ public final class DiagnosticsService {
         if (actions.isEmpty()) return;
         if (actions.contains(StallDetector.Action.STARTED)) {
             stall = new StallRecord(stallDetector.stallTickEnd(), ticks);
+            automaticCapture.request("server-stall: last completed tick " + ticks, now);
         }
         StallRecord record = stall;
         if (record == null) return;
@@ -371,7 +398,8 @@ public final class DiagnosticsService {
     private String culpritText(StallRecord record) {
         String culprit = record.profile.topCulprit();
         Hooks.SyncWait wait = record.syncWait;
-        if (wait != null) return (culprit == null ? "vanilla" : culprit) + ", blocked loading chunk " + wait.describe();
+        if (wait != null) return (culprit == null ? "vanilla" : culprit)
+                + ", chunk-executor wait; last observed chunk request " + wait.describe();
         return culprit == null ? "no mod frame on the stack (vanilla or JVM)" : culprit;
     }
 
@@ -381,6 +409,7 @@ public final class DiagnosticsService {
         if (stuck.isEmpty()) return;
         ChunkTaskTracker.Entry oldest = stuck.get(0);
         if (!cooldownPassed("pipeline")) return;
+        automaticCapture.request("chunk-pipeline: tasks older than " + config.chunkTaskStallMs + "ms", now);
         pipelineStalls.increment();
         MinefedDiagnostics.LOGGER.warn("Chunk pipeline stall: {} chunk tasks older than {}s, oldest {} waiting {}ms",
                 stuck.size(), config.chunkTaskStallMs / 1000, oldest.key(), chunkTasks.ageNanos(oldest) / 1_000_000);
@@ -432,7 +461,7 @@ public final class DiagnosticsService {
         Hooks.SyncWait wait = Hooks.currentSyncWait();
         if (wait != null) {
             notes.put(serverThread.getId(), "blocked " + (System.nanoTime() - wait.startNanos()) / 1_000_000
-                    + "ms waiting for chunk " + wait.describe());
+                    + "ms in chunk executor; last observed chunk request " + wait.describe());
         }
         for (Hooks.OffThreadWait off : Hooks.offThreadWaits()) {
             notes.put(off.thread().getId(), "in getChunk for " + (System.nanoTime() - off.startNanos()) / 1_000_000
@@ -497,7 +526,7 @@ public final class DiagnosticsService {
         Hooks.SyncWait wait = Hooks.currentSyncWait();
         if (wait != null) {
             out.append("Server thread is blocked right now for ").append((System.nanoTime() - wait.startNanos()) / 1_000_000)
-                    .append("ms waiting for chunk ").append(wait.describe()).append('\n');
+                    .append("ms in chunk executor; last observed chunk request ").append(wait.describe()).append('\n');
         }
         List<Hooks.OffThreadWait> waiting = Hooks.offThreadWaits();
         if (!waiting.isEmpty()) {
@@ -525,14 +554,15 @@ public final class DiagnosticsService {
         out.append("Culprit: ").append(culpritText(record)).append('\n');
         out.append("Players online: ").append(record.players).append(", ").append(record.tickStats).append('\n');
         if (record.syncWait != null) {
-            out.append("Server thread was blocked waiting for chunk ").append(record.syncWait.describe())
-                    .append(" (blocking chunk load on the server thread)\n");
+            out.append("Server thread was waiting in chunk executor; last observed chunk request ").append(record.syncWait.describe())
+                    .append(" (the executor may be waiting for loading or a flushing save)\n");
         }
         if (lastFreezeEnd != 0 && lastFreezeEnd >= record.tickEnd) {
-            out.append("JVM freeze overlapped this stall: ").append(lastFreezeNanos / 1_000_000)
-                    .append("ms where no thread ran (GC/swap/CPU throttling, not game code)\n");
+            out.append("Watchdog scheduling delay overlapped this stall: ").append(lastFreezeNanos / 1_000_000)
+                    .append("ms; cause requires JFR/GC and OS correlation\n");
         }
-        out.append("GC during stall: ").append(ThreadDumps.gcDelta(record.gcBefore, ThreadDumps.gcTotals())).append('\n');
+        out.append("GC since stall detection (earlier pauses may be absent): ")
+                .append(ThreadDumps.gcDelta(record.gcBefore, ThreadDumps.gcTotals())).append('\n');
         out.append("Attribution index: ").append(attribution.packageCount()).append(" packages\n");
         out.append("Names are intermediary (net.minecraft.class_XXXX.method_YYYY); map them with Yarn 1.20.4+build.3.\n");
         out.append("\n=== Server thread profile ===\n");
@@ -594,7 +624,7 @@ public final class DiagnosticsService {
                     Hooks.OffThreadWait off = findOffThreadWait(owner);
                     ThreadDumps.appendThread(text, ownerInfo, attribution, off == null ? null
                             : "this thread is itself waiting in getChunk for the server thread: " + off.describe()
-                            + " -> DEADLOCK between the server thread and this thread");
+                            + " -> suspected circular wait; confirm with current stacks and JVM deadlock detection");
                     lockOwners.put(info.getLockOwnerName(), text.toString());
                 }
             }
@@ -631,8 +661,9 @@ public final class DiagnosticsService {
                 .append(tickStats()).append('\n');
         b.append(String.format("Stalls: %d (reported %d, max %dms, last culprit %s), ticks > 250ms: %d%n", stalls.sum(),
                 reportedStalls.sum(), maxStallNanos.get() / 1_000_000, lastStallCulprit, longTicks.sum()));
-        b.append(String.format("JVM freezes: %d (max %dms), pipeline stalls: %d, send stalls: %d, ack resets: %d%n",
+        b.append(String.format("Watchdog delays: %d (max %dms), pipeline stalls: %d, send observations: %d, ack resets: %d%n",
                 jvmFreezes.sum(), maxFreezeNanos.get() / 1_000_000, pipelineStalls.sum(), sendStalls.sum(), ackResets.sum()));
+        b.append("Automatic capture: ").append(automaticCapture.status()).append('\n');
         List<ChunkTaskTracker.Entry> oldest = chunkTasks.oldest(1);
         b.append("In-flight chunk tasks: ").append(chunkTasks.inFlightCount());
         if (!oldest.isEmpty()) b.append(", oldest ").append(chunkTasks.ageNanos(oldest.get(0)) / 1_000_000).append("ms ").append(oldest.get(0).key());

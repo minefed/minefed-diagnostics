@@ -7,20 +7,24 @@ import java.util.UUID;
 /**
  * Watches the per-player chunk sender. Since 1.20.2 the server sends chunks in batches and stops once
  * the client has not acknowledged {@code maxUnacknowledgedBatches} batches; it also only sends chunks that
- * have finished loading. A player whose pending set does not shrink is therefore stuck for one of two
- * reasons, which this class tells apart.
+ * have finished loading. Queue size alone is not proof of a stall: movement may replenish it.
+ * Activity counters prevent normal batch/ACK traffic at a constant queue size from being reported.
  */
 public final class ChunkSendMonitor {
     public enum Verdict {
         /** The server waits for the client to acknowledge earlier batches (network, proxy or client side). */
         WAITING_FOR_CLIENT_ACK,
-        /** Acknowledgements are fine but the pending chunks never become ready (server chunk pipeline). */
-        CHUNKS_NOT_READY
+        /** No observed batch/ACK progress. Chunk readiness and network causes require further evidence. */
+        NO_CHUNK_SEND_PROGRESS
     }
 
     /** One reading of a player's {@code ChunkDataSender}. */
     public record Snapshot(int pendingChunks, int unacknowledgedBatches, int maxUnacknowledgedBatches,
-                           float desiredBatchSize, float batchQuota) {
+                           float desiredBatchSize, float batchQuota, long activity) {
+        public Snapshot(int pendingChunks, int unacknowledgedBatches, int maxUnacknowledgedBatches,
+                        float desiredBatchSize, float batchQuota) {
+            this(pendingChunks, unacknowledgedBatches, maxUnacknowledgedBatches, desiredBatchSize, batchQuota, -1);
+        }
         boolean ackBlocked() {
             return unacknowledgedBatches >= maxUnacknowledgedBatches;
         }
@@ -53,6 +57,7 @@ public final class ChunkSendMonitor {
         boolean progressed = last == null
                 || now.pendingChunks() == 0
                 || last.pendingChunks() == 0
+                || (now.activity() >= 0 && now.activity() != last.activity())
                 || now.pendingChunks() < last.pendingChunks()
                 || now.unacknowledgedBatches() < last.unacknowledgedBatches();
         state.last = now;
@@ -64,7 +69,7 @@ public final class ChunkSendMonitor {
         }
         long stuck = time - state.lastProgress;
         if (stuck < stallNanos) return null;
-        Verdict verdict = now.ackBlocked() ? Verdict.WAITING_FOR_CLIENT_ACK : Verdict.CHUNKS_NOT_READY;
+        Verdict verdict = now.ackBlocked() ? Verdict.WAITING_FOR_CLIENT_ACK : Verdict.NO_CHUNK_SEND_PROGRESS;
         boolean first = !state.reported;
         state.reported = true;
         boolean reset = verdict == Verdict.WAITING_FOR_CLIENT_ACK && stuck >= resetAfterNanos && !state.reset;

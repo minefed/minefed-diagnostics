@@ -3,7 +3,6 @@ package team.minefed.diagnostics;
 import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
@@ -32,14 +31,6 @@ public final class MinefedDiagnostics implements DedicatedServerModInitializer {
             DiagnosticsService s = service;
             service = null;
             if (s != null) s.stop();
-        });
-        ServerTickEvents.START_SERVER_TICK.register(server -> {
-            DiagnosticsService s = service;
-            if (s != null) s.onTickStart();
-        });
-        ServerTickEvents.END_SERVER_TICK.register(server -> {
-            DiagnosticsService s = service;
-            if (s != null) s.onTickEnd();
         });
         ServerWorldEvents.UNLOAD.register((server, world) -> {
             DiagnosticsService s = service;

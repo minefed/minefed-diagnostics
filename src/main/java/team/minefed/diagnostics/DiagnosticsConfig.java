@@ -38,8 +38,12 @@ public final class DiagnosticsConfig {
     /** Opt-in recovery: clear a lost client chunk-batch acknowledgement after this long. */
     public final boolean chunkSendResetStuckAcks;
     public final long chunkSendResetAfterMs;
-    /** The watchdog oversleeping by this much means the whole JVM was frozen. */
+    /** Watchdog scheduling delay; this alone cannot distinguish GC, CPU contention or host suspension. */
     public final long jvmFreezeWarnMs;
+    public final boolean captureEnabled, captureJfrEnabled;
+    public final long captureCooldownMs, captureSampleMs, captureHistorySeconds, captureMaxMiB, captureRetainMiB;
+    public final int captureRetain, slowTickWindow;
+    public final long slowTickThresholdMs;
     /** Minimum time between two chunk stall reports of the same kind. */
     public final long reportCooldownMs;
     /** Number of report files kept in logs/minefed-diagnostics. */
@@ -61,6 +65,16 @@ public final class DiagnosticsConfig {
         chunkSendResetStuckAcks = Boolean.parseBoolean(values.get("chunkSend.resetStuckAcks"));
         chunkSendResetAfterMs = clamp(parseLong(values, "chunkSend.resetAfterMs"), chunkSendStallMs, 3_600_000);
         jvmFreezeWarnMs = clamp(parseLong(values, "jvmFreeze.warnMs"), 100, 600_000);
+        captureEnabled = Boolean.parseBoolean(values.get("capture.enabled"));
+        captureJfrEnabled = Boolean.parseBoolean(values.get("capture.jfrEnabled"));
+        captureCooldownMs = clamp(parseLong(values, "capture.cooldownMs"), 10_000, 86_400_000);
+        captureSampleMs = clamp(parseLong(values, "capture.sampleMs"), 1_000, 30_000);
+        captureHistorySeconds = clamp(parseLong(values, "capture.historySeconds"), 10, 600);
+        captureMaxMiB = clamp(parseLong(values, "capture.maxMiB"), 8, 256);
+        captureRetainMiB = clamp(parseLong(values, "capture.retainMiB"), 32, 4096);
+        captureRetain = (int) clamp(parseLong(values, "capture.retain"), 1, 100);
+        slowTickWindow = (int) clamp(parseLong(values, "slowTicks.window"), 20, 1200);
+        slowTickThresholdMs = clamp(parseLong(values, "slowTicks.thresholdMs"), 51, 1000);
         reportCooldownMs = clamp(parseLong(values, "report.cooldownMs"), 0, 86_400_000);
         reportRetain = (int) clamp(parseLong(values, "report.retain"), 1, 100_000);
         summaryIntervalMs = clamp(parseLong(values, "summary.intervalMinutes"), 1, 1_440) * 60_000L;
@@ -82,6 +96,16 @@ public final class DiagnosticsConfig {
         d.put("chunkSend.resetStuckAcks", "false");
         d.put("chunkSend.resetAfterMs", "30000");
         d.put("jvmFreeze.warnMs", "1000");
+        d.put("capture.enabled", "true");
+        d.put("capture.jfrEnabled", "true");
+        d.put("capture.cooldownMs", "300000");
+        d.put("capture.sampleMs", "2000");
+        d.put("capture.historySeconds", "120");
+        d.put("capture.maxMiB", "32");
+        d.put("capture.retainMiB", "512");
+        d.put("capture.retain", "8");
+        d.put("slowTicks.window", "100");
+        d.put("slowTicks.thresholdMs", "75");
         d.put("report.cooldownMs", "300000");
         d.put("report.retain", "200");
         d.put("summary.intervalMinutes", "10");
@@ -132,7 +156,8 @@ public final class DiagnosticsConfig {
     }
 
     private static boolean isValid(String key, String value) {
-        if (key.equals("chunkSend.resetStuckAcks")) return value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false");
+        if (key.equals("chunkSend.resetStuckAcks") || key.equals("capture.enabled") || key.equals("capture.jfrEnabled"))
+            return value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false");
         try {
             Long.parseLong(value);
             return true;

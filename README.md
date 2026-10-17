@@ -1,83 +1,95 @@
 # Minefed Diagnostics
 
-Minefed 서버(Minecraft 1.20.4 / Fabric)에서 **청크 로딩이 멈추거나 서버가 멈추는(hang) 현상의 원인을 기록**하는
-서버 전용 모드다. 게임 동작은 바꾸지 않는다. 문제가 생긴 순간의 증거를 남겨 원인 모드나 환경을 특정하는 것이 목적이다.
+Minecraft 1.20.4 / Fabric Loader 0.18.4 / Java 17 이상의 서버 전용 진단 모드다.
+서버가 시작되면 자동 감시와 순환 기록을 시작한다. 장애 때 명령을 입력하거나 외부 스케줄러를 실행할 필요가 없다.
+클라이언트에는 설치하지 않는다. 기본 설정은 진단만 수행하며 게임 상태를 복구·변경하지 않는다.
 
-## 무엇을 잡아내는가
+## 자동 수집
 
-증상이 같아 보여도 원인은 서로 다른 네 경로 중 하나다. 모드는 각각을 따로 감지하고 판정을 남긴다.
-
-| 감지기 | 상황 | 남기는 것 |
-| --- | --- | --- |
-| 서버 스레드 정지 | 서버 틱이 `stall.thresholdMs`(1초) 이상 끝나지 않음 | 50ms 간격 스택 샘플 프로파일, 원인 모드 순위, 락 소유 스레드, 5초·40초 시점 전체 스레드 덤프 |
-| 서버 스레드의 동기 청크 로드 | 서버 스레드가 준비되지 않은 청크를 기다리며 막힘 | 요청한 코드(모드)별 횟수·누적·최대 시간, 청크 좌표, 첫 호출 스택 |
-| 다른 스레드의 getChunk | MTR·BlueMap 등 다른 스레드가 `getChunk`로 서버 스레드를 기다림 | 호출자별 통계. 서버 스레드가 그 스레드의 락을 기다리면 **교착 상태**로 표시 |
-| 청크 파이프라인 정지 | 틱은 정상인데 청크 읽기·생성·완성 단계가 `chunkTask.stallMs`(20초) 넘게 끝나지 않음 | 멈춘 청크 목록과 holder 상태, 우선순위 큐·리전 IO 큐·워커 풀 상태, 스레드 덤프 |
-| 청크 전송 정지 | 플레이어에게 보낼 청크가 남았는데 10초간 줄지 않음 | `WAITING_FOR_CLIENT_ACK`(클라이언트·프록시·네트워크 문제) 또는 `CHUNKS_NOT_READY`(서버 파이프라인 문제) 판정 |
-| JVM 전체 정지 | 감시 스레드조차 1초 이상 실행되지 못함 | GC 통계. 게임 코드가 아니라 GC·스왑·컨테이너 CPU 제한 문제임을 구분 |
-
-바닐라 서버 감시자는 틱이 60초를 넘으면 서버를 강제 종료한다. 이 모드는 그 전에(5초, 40초) 진행 중 보고서를 디스크에
-써 두므로 서버가 강제 종료되어도 증거가 남는다.
-
-## 결과 확인
-
-- 로그: `MinefedDiagnostics` 로거의 WARN 한 줄 요약. 예: `Server thread stalled for 8123ms (tick 51234); culprit: mtr; report ...`
-- 보고서: `logs/minefed-diagnostics/<시각>_<종류>.txt` (`server-stall`, `chunk-pipeline-stall`, `chunk-send-stall`, `snapshot`).
-  최신 `report.retain`개(기본 200)만 남긴다.
-- 요약: 10분마다 `logs/minefed-diagnostics/summary.log`에 누적 통계를 추가한다.
-- 스택의 Minecraft 이름은 운영 환경 그대로 intermediary(`net.minecraft.class_3215.method_12121`)다.
-  Yarn `1.20.4+build.3` 매핑으로 바꿔 읽는다.
-
-## 명령 (권한 4, 콘솔 가능)
-
-| 명령 | 설명 |
+| 감지 조건(기본값) | 동작 |
 | --- | --- |
-| `/mfdiag` 또는 `/mfdiag status` | 틱 상태, 정지·동결 횟수, 진행 중 청크 작업, 훅 동작 여부 |
-| `/mfdiag chunks` | 월드별 청크 큐 상태와 가장 오래된 청크 작업 |
-| `/mfdiag players` | 플레이어별 청크 전송 대기열과 미확인 배치 수 |
-| `/mfdiag callers` | 동기 청크 로드·다른 스레드 getChunk 상위 호출자 |
-| `/mfdiag dump` | 즉시 전체 스냅샷 보고서 작성 |
-| `/mfdiag reset` | 누적 통계 초기화 |
-| `/mfdiag selftest stall <ms>` | 서버 스레드를 일부러 멈춰 감지·보고서 동작 확인(최대 30초) |
+| 첫 틱 시작 이후 마지막 틱 완료로부터 1초 경과 | 서버 스택 샘플링과 자동 수집 요청 |
+| 완료된 100틱의 평균 작업 시간이 75ms 이상 | 지속적인 느린 틱 수집 요청 |
+| 감시 스레드가 예상보다 1초 이상 늦게 깨어남 | 감시 스레드 지연 수집 요청 |
+| 청크 작업이 20초 이상 끝나지 않음 | 청크 작업·스레드 보고서와 수집 요청 |
+| 대기 청크가 있는데 배치 준비·ACK 등 전송 진전이 10초간 없음 | 전송 상태 보고서와 수집 요청 |
 
-`Hooks fired`에 `-`로 표시된 훅은 아직 한 번도 호출되지 않은 것이다. 서버가 청크를 로드한 뒤에도
-`loadChunk-`처럼 남아 있으면 다른 모드와의 충돌로 주입이 빠진 것이므로 보고서 해석에 주의한다.
+`logs/minefed-diagnostics/captures/capture-<UTC>-<UUID>.txt`와 같은 이름의 `.jfr`에 저장한다.
+텍스트에는 감지·수집 시각, 직전 OS/JVM 지표, 현재 지표, 전체 스레드 덤프가 들어간다.
+JFR은 기본 최근 120초 / 최대 32MiB의 순환 기록이다. 이상 감지 후 별도 작업 스레드가 현재 기록을 덤프하고 계속 기록한다.
+최초 기동 직후에는 이력이 짧으며, 저장 지연 동안 오래된 기록이 순환 범위 밖으로 밀릴 수 있다.
+JFR을 사용할 수 없어도 OS/스레드 텍스트 수집을 시도한다. 개별 관측 실패는 `UNAVAILABLE`로 남긴다.
 
-## 설정
+모든 자동 수집 원인은 **5분의 공통 간격 제한**을 공유한다. 동시에 수집 1건만 대기·실행한다.
+완료 파일은 최신 8건 및 총 512MiB 이내로 오래된 것부터 정리한다. 한 건이 보관량보다 커도 한도를 우선한다.
+JFR 용량 제한은 청크 단위이므로 정확한 바이트 상한이 아니며 덤프 중에는 임시 복사본 공간도 필요하다.
+자체 파일명 규칙과 일치하는 파일만 지운다. 중단된 `.jfr.part`는 다음 기동에서 정리한다.
+기존 상세 보고서는 상위 디렉터리에 별도로 최신 200개를 보관하며 요약은 `summary.log`에 기록한다.
 
-첫 실행 시 `config/minefed-diagnostics.properties`가 기본값으로 생성된다. 변경 후 서버를 재시작한다.
+Linux에서는 `/proc/self`의 CPU·메모리·IO·스케줄링·네트워크 카운터와 PSI, cgroup v2의 CPU 제한·throttle·메모리·IO를 읽는다.
+파일마다 최대 8KiB를 읽으며 누락은 0이 아닌 `MISSING_OR_UNREADABLE`로 표시한다.
+cgroup 후보 경로와 소속을 같이 기록하므로 컨테이너 네임스페이스 또는 공유 cgroup 여부를 확인해 해석한다.
+Windows에서는 JVM 지표를 기록하고 Linux 지표를 사용할 수 없다고 명시한다.
+프로세스 환경 변수·명령행은 읽지 않으며 자체 JFR의 초기 환경 변수·시스템 속성·JVMInformation 이벤트를 끈다.
+JFR 설정은 JVM 내 다른 녹화와 합쳐질 수 있으므로 다른 녹화가 같은 이벤트를 켜면 제외를 보장할 수 없다.
+파일 경로·스택·플레이어 이름·좌표가 보고서에 포함될 수 있으므로 공유 전 내용을 확인한다. 외부 업로드는 하지 않는다.
+
+## 해석과 한계
+
+감지 라벨은 관측 결과다. 감시 스레드 지연만으로 GC·CPU 제한·스왑·호스트 중단 중 하나를 단정할 수 없다.
+`WAITING_FOR_CLIENT_ACK`는 미확인 배치 상한 도달, `NO_CHUNK_SEND_PROGRESS`는 관측된 전송 진전 부재를 뜻한다.
+일정한 큐 길이에서도 새 배치와 ACK가 진행되면 정지로 보지 않는다. 실제 소켓 전송 성공을 증명하는 계측은 아니다.
+스택의 모드 순위도 원인 확정이 아닌 조사 단서다. JFR, GC 변화량, OS 지표와 `ticks behind` 시각을 함께 비교한다.
+
+MinecraftServer.tick 진입·반환을 계측하므로 Fabric START/END 콜백도 포함한다. 틱 사이의 정상 대기 시간은 제외한다.
+100틱 창은 실제 시간이 아닌 완료 틱 수 기준이며 겹치지 않는다. 창 경계의 짧은 지연은 평균에 희석될 수 있다.
+첫 틱 이전의 초기 월드 로딩은 이 감시 범위 밖이다. JVM/호스트 전체가 정지하면 내부 수집기도 실행될 수 없고 재개 후 기록한다.
+강제 종료 전에 쓰기가 끝난 파일만 남으므로 커널·전원 장애까지 완전하게 보장하지 않는다.
+
+## 설정과 명령
+
+첫 기동에 `config/minefed-diagnostics.properties`가 생성된다. 누락된 키는 기본값을 추가하며 변경은 다음 기동에 적용한다.
 
 | 키 | 기본값 | 의미 |
 | --- | ---: | --- |
-| `stall.thresholdMs` | 1000 | 이 시간 동안 틱이 끝나지 않으면 샘플링 시작 |
-| `stall.reportMinMs` | 3000 | 이보다 짧은 정지는 횟수만 센다 |
-| `stall.sampleIntervalMs` | 50 | 정지 중 스택 샘플 간격 |
-| `stall.firstDumpMs` / `stall.secondDumpMs` | 5000 / 40000 | 진행 중 보고서와 전체 스레드 덤프 시점 |
-| `syncLoad.warnMs` | 100 | 서버 스레드 동기 청크 대기 기록 기준 |
-| `offThread.warnMs` | 500 | 다른 스레드 getChunk 대기 기록 기준 |
-| `chunkTask.stallMs` | 20000 | 청크 작업 정지 판정 기준 |
-| `chunkSend.stallMs` | 10000 | 청크 전송 정지 판정 기준 |
-| `chunkSend.resetStuckAcks` | false | 켜면 클라이언트 확인 응답이 `chunkSend.resetAfterMs`(30초) 넘게 오지 않을 때 미확인 배치 수를 0으로 되돌려 전송을 재개한다. 기본은 기록만 한다. |
-| `jvmFreeze.warnMs` | 1000 | JVM 전체 정지 판정 기준 |
-| `report.cooldownMs` | 300000 | 같은 종류 청크 보고서의 최소 간격 |
+| `capture.enabled` / `capture.jfrEnabled` | true / true | 자동 파일 수집 / 순환 JFR |
+| `capture.historySeconds` / `capture.maxMiB` | 120 / 32 | 순환 기록 범위 |
+| `capture.sampleMs` / `capture.cooldownMs` | 2000 / 300000 | OS 표본 간격 / 공통 수집 간격 |
+| `capture.retain` / `capture.retainMiB` | 8 / 512 | 자동 수집 보관 건수 / 합산 용량 |
+| `slowTicks.window` / `slowTicks.thresholdMs` | 100 / 75 | 완료 틱 창 / 평균 작업 시간 기준 |
+| `stall.thresholdMs` / `stall.reportMinMs` | 1000 / 3000 | 정지 감지 / 상세 보고서 최소 길이 |
+| `stall.sampleIntervalMs` | 50 | 정지 중 스택 표본 간격 |
+| `stall.firstDumpMs` / `stall.secondDumpMs` | 5000 / 40000 | 진행 중 상세 덤프 시점 |
+| `syncLoad.warnMs` / `offThread.warnMs` | 100 / 500 | 서버 / 다른 스레드의 동기 청크 대기 기록 기준 |
+| `chunkTask.stallMs` / `chunkSend.stallMs` | 20000 / 10000 | 청크 작업 / 전송 관측 기준 |
+| `jvmFreeze.warnMs` | 1000 | 감시 스레드 스케줄링 지연 기준(과거 키 이름 유지) |
+| `chunkSend.resetStuckAcks` | false | 명시적으로 켜면 장기 ACK 대기의 미확인 배치 수 초기화 |
+| `report.cooldownMs` / `report.retain` | 300000 / 200 | 같은 종류 청크 상세 보고서 간격 / 상세 파일 수 |
 
-## 부하
+권한 4 또는 콘솔에서 `/mfdiag status`, `chunks`, `players`, `callers`, `dump`, `reset`을 사용할 수 있다.
+자동 수집에는 이 명령이 필요하지 않다. `status`에는 JFR 상태와 `tickStart`/`tickEnd` 등 실제 호출된 훅을 표시한다.
+`Hooks fired`의 `-`는 아직 호출되지 않은 훅이다. 충분한 틱/청크 작업 뒤에도 비어 있으면 계측 누락을 조사한다.
+`offThreadGetChunk`와 `offThreadGetChunkEnd`는 다른 스레드의 청크 요청 시작과 정리가 실제 관측됐음을 나타낸다.
+해당 요청이 없으면 둘 다 비어 있는 것이 정상이다. 종료 훅은 정상 반환과 예외 종료 모두 기록한다.
+`/mfdiag selftest stall <ms>`는 서버를 실제로 정지시키므로 격리된 테스트 서버에서만 사용한다.
 
-서버 스레드에서 추가되는 일은 `getChunk` 진입 시 스레드 비교와 요청 좌표 기록(할당 없음), 틱마다 시간 기록,
-1초마다 플레이어별 전송 상태 확인뿐이다. 스택 샘플·덤프·파일 쓰기는 별도 데몬 스레드
-(`Minefed-Diagnostics-Watchdog`, `Minefed-Diagnostics-Reporter`)에서 수행한다. 모든 주입은 실패해도 서버를
-멈추지 않도록 `require = 0`이며, 훅 내부 오류는 기록 후 무시한다.
+## 부하와 빌드
 
-## 호환성
-
-운영 서버팩 20261014150849의 모드 70개(Lithium의 `getChunk` 덮어쓰기, ModernFix의 청크 스케줄링 변경,
-Carpet, Chunky 포함)와 함께 `tools/mixin-audit`를 모든 인젝터 필수 조건으로 실행해 통과를 확인했다.
-
-## 빌드
+틱 훅은 시간·고정 크기 창을 갱신하고 필요할 때 작업을 등록한다. 파일 쓰기·OS 수집·JFR 덤프는 별도 데몬 스레드에서 수행한다.
+메인 스레드의 `getChunk` 캐시 조회에는 인자 관측만 추가하며, 계측을 위한 배열·박싱·콜백 객체를 만들지 않는다.
+예외 종료 정리를 위한 래퍼는 Vanilla 1.20.4의 비서버 스레드 분기와 고정된 Lithium 0.12.1의 `getChunkOffThread`에만 적용한다.
+다른 버전의 구현까지 보장하지 않으며, 이 선택적 훅은 실제 요청과 Mixin 검사를 통해 확인한다.
+청크 전송 상태는 20틱마다 읽으며, 이상 시 서버 스레드에서 플레이어 상태와 일부 청크 정보도 읽는다.
+JFR 표본·스레드 덤프·파일 IO의 측정 비용은 존재한다. 인젝터의 적용 누락은 상태와 Mixin 검사로 확인한다.
+accessor와 클래스 적용 자체의 비호환까지 무시하는 것은 아니다.
 
 ```sh
-./gradlew build
+./gradlew test build
 ```
 
-Windows에서 사용자 경로에 한글이 있으면 Gradle 테스트 워커가 시작되지 않는다. 이때는
-`./gradlew build "-Dorg.gradle.jvmargs=-Xmx1G"`로 데몬의 `file.encoding` 지정을 빼고 실행한다.
+Windows 한글 사용자 경로에서 테스트 워커 문제가 있으면 `"-Dorg.gradle.jvmargs=-Xmx1G"`로 데몬의 강제 인코딩을 해제한다.
+이 환경의 JDK 17/21에서는 기본 JFR 저장소 경로에 한글이 있으면 빈 덤프가 재현됐다.
+테스트 JVM에 ASCII 경로의 `-Djava.io.tmpdir=...`를 지정하면 실제 JFR 생성·파싱 검사를 통과한다.
+운영 Windows에서도 같은 현상이 있으면 시작 시 ASCII 임시 디렉터리를 지정한다. Linux 수집에는 이 경로 설정이 필요하지 않다.
+자동 수집 테스트는 실제 JFR을 생성·파싱하며 공통 간격 제한, 보관량, 장애 격리, OS 읽기 범위를 검증한다.
+MIT 라이선스와 저작권 고지를 JAR에 보존한다.
