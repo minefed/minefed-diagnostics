@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
@@ -71,6 +72,50 @@ class AutomaticCaptureTest {
                     && e.getDouble("averageMs") == 90));
             assertFalse(events.stream().anyMatch(e -> List.of("jdk.InitialEnvironmentVariable", "jdk.InitialSystemProperty", "jdk.JVMInformation")
                     .contains(e.getEventType().getName())));
+        } finally { capture.close(); }
+    }
+
+    @Test void retentionKeepsNewestTwoWithIdenticalDetectionTimes(@TempDir Path dir) throws Exception {
+        assertNewestTwoRetained(dir, List.of(Instant.parse("2026-10-17T01:02:03Z"),
+                Instant.parse("2026-10-17T01:02:03Z"), Instant.parse("2026-10-17T01:02:03Z")));
+    }
+
+    @Test void retentionKeepsNewestTwoWhenWallClockMovesBack(@TempDir Path dir) throws Exception {
+        assertNewestTwoRetained(dir, List.of(Instant.parse("2026-10-17T01:02:03Z"),
+                Instant.parse("2026-10-17T00:02:03Z"), Instant.parse("2026-10-16T23:02:03Z")));
+    }
+
+    private void assertNewestTwoRetained(Path dir, List<Instant> detections) throws Exception {
+        var capture = new AutomaticCapture(config("capture.retain", "2"), dir, () -> "", ignored -> {});
+        try {
+            var bases = new java.util.ArrayList<String>();
+            for (int i = 0; i < detections.size(); i++) {
+                String base = capture.nextCaptureBase(detections.get(i));
+                bases.add(base);
+                Files.writeString(dir.resolve(base + ".txt"), "report " + i);
+                Files.writeString(dir.resolve(base + ".jfr"), "recording " + i);
+                capture.prune();
+            }
+            for (int i = 0; i < bases.size(); i++) {
+                assertEquals(i > 0, Files.exists(dir.resolve(bases.get(i) + ".txt")));
+                assertEquals(i > 0, Files.exists(dir.resolve(bases.get(i) + ".jfr")));
+            }
+        } finally { capture.close(); }
+    }
+
+    @Test void retentionContinuesFilenameOrderAfterRestart(@TempDir Path dir) throws Exception {
+        String old = "capture-20261017T010203456Z-" + UUID.randomUUID();
+        Files.writeString(dir.resolve(old + ".txt"), "previous process");
+        var capture = new AutomaticCapture(config("capture.jfrEnabled", "false", "capture.retain", "1"),
+                dir, () -> "", ignored -> {});
+        try {
+            capture.start();
+            capture.awaitIdle();
+            String current = capture.nextCaptureBase(Instant.parse("2026-10-16T01:02:03Z"));
+            Files.writeString(dir.resolve(current + ".txt"), "current process");
+            capture.prune();
+            assertTrue(Files.exists(dir.resolve(current + ".txt")));
+            assertFalse(Files.exists(dir.resolve(old + ".txt")));
         } finally { capture.close(); }
     }
 

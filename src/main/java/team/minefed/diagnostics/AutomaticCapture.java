@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,6 +35,7 @@ final class AutomaticCapture implements AutoCloseable {
     private final Consumer<String> log;
     private final ScheduledThreadPoolExecutor worker;
     private final ArrayDeque<String> history = new ArrayDeque<>(); // worker thread only
+    private long lastCaptureMillis = Long.MIN_VALUE; // worker thread only; restored from owned filenames
     private Recording recording;
     private boolean pending, hasCaptured;
     private long lastAccepted;
@@ -121,7 +123,7 @@ final class AutomaticCapture implements AutoCloseable {
 
     private void capture(String reason, Instant detected) throws IOException {
         Files.createDirectories(directory);
-        String base = "capture-" + STAMP.format(detected) + "-" + UUID.randomUUID();
+        String base = nextCaptureBase(detected);
         Path report = directory.resolve(base + ".txt");
         // Write the text first so it survives even if JFR dump fails or the JVM exits during the dump.
         StringBuilder text = new StringBuilder("Minefed automatic incident capture\nDetected UTC: ").append(detected)
@@ -158,6 +160,12 @@ final class AutomaticCapture implements AutoCloseable {
         catch (Exception | LinkageError e) { return "UNAVAILABLE: " + e.getClass().getSimpleName() + "\n"; }
     }
 
+    /** A strictly increasing filename key keeps retention chronological even if the wall clock moves back. */
+    String nextCaptureBase(Instant detected) {
+        lastCaptureMillis = Math.max(detected.toEpochMilli(), lastCaptureMillis + 1);
+        return "capture-" + STAMP.format(Instant.ofEpochMilli(lastCaptureMillis)) + "-" + UUID.randomUUID();
+    }
+
     /** Runs only at startup, before this instance can have an active dump. */
     void removeInterruptedDumps() throws IOException {
         try (var paths = Files.list(directory)) {
@@ -177,6 +185,11 @@ final class AutomaticCapture implements AutoCloseable {
         long bytes = 0;
         for (Path path : files) {
             String name = path.getFileName().toString();
+            // Continue the order across restarts; the report still records the actual detection time.
+            try {
+                long millis = Instant.from(STAMP.parse(name.substring(8, 27))).toEpochMilli();
+                lastCaptureMillis = Math.max(lastCaptureMillis, millis);
+            } catch (DateTimeParseException ignored) { /* A malformed owned filename cannot advance the clock. */ }
             String base = name.substring(0, name.lastIndexOf('.'));
             if (groups.isEmpty() || !groups.get(groups.size() - 1).equals(base)) groups.add(base);
             bytes += Files.size(path);
